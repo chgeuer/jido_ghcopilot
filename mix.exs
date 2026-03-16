@@ -88,7 +88,10 @@ defmodule Jido.GHCopilot.MixProject do
       {:doctor, "~> 0.22", only: :dev, runtime: false},
       {:excoveralls, "~> 0.18", only: [:dev, :test]},
       {:git_hooks, "~> 0.8", only: [:dev, :test], runtime: false},
-      {:git_ops, "~> 2.9", only: :dev, runtime: false}
+      {:git_ops, "~> 2.9", only: :dev, runtime: false},
+      {:mix_audit, "~> 2.1", only: [:dev, :test]},
+      {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false},
+      {:ex_slop, "~> 0.2", only: [:dev, :test], runtime: false}
     ]
   end
 

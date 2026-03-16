@@ -50,10 +50,41 @@ defmodule Mix.Tasks.GhcopilotTasksTest do
   end
 
   describe "mix ghcopilot.compat" do
-    test "reports CLI status" do
+    setup do
+      old_cli = Application.get_env(:jido_ghcopilot, :cli_module)
+      old_cmd = Application.get_env(:jido_ghcopilot, :command_module)
+
+      Application.put_env(:jido_ghcopilot, :cli_module, Jido.GHCopilot.Test.StubCLI)
+      Application.put_env(:jido_ghcopilot, :command_module, Jido.GHCopilot.Test.StubCommand)
+
+      on_exit(fn ->
+        if old_cli,
+          do: Application.put_env(:jido_ghcopilot, :cli_module, old_cli),
+          else: Application.delete_env(:jido_ghcopilot, :cli_module)
+
+        if old_cmd,
+          do: Application.put_env(:jido_ghcopilot, :command_module, old_cmd),
+          else: Application.delete_env(:jido_ghcopilot, :command_module)
+      end)
+
+      :ok
+    end
+
+    test "reports CLI found" do
       output = capture_task(fn -> Mix.Tasks.Ghcopilot.Compat.run([]) end)
-      # Should either find it or not — both are valid outcomes
-      assert output =~ "Copilot CLI" or output =~ "copilot"
+      assert output =~ "Copilot CLI"
+    end
+
+    test "reports CLI not found" do
+      Application.put_env(:jido_ghcopilot, :stub_cli_resolve_path, fn -> nil end)
+      on_exit(fn -> Application.delete_env(:jido_ghcopilot, :stub_cli_resolve_path) end)
+
+      stderr =
+        ExUnit.CaptureIO.capture_io(:stderr, fn ->
+          Mix.Tasks.Ghcopilot.Compat.run([])
+        end)
+
+      assert stderr =~ "Copilot CLI not found"
     end
   end
 

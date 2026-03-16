@@ -11,10 +11,12 @@ defmodule Mix.Tasks.Ghcopilot.Compat do
 
   @impl true
   def run(_args) do
-    if Jido.GHCopilot.cli_installed?() do
-      cli_path = Jido.GHCopilot.CLI.resolve_path()
+    alias Jido.GHCopilot.Compatibility
 
-      case Jido.GHCopilot.SystemCommand.run(cli_path, ["--version"]) do
+    if Jido.GHCopilot.cli_installed?() do
+      cli_path = Compatibility.cli_module().resolve_path()
+
+      case Compatibility.command_module().run(cli_path, ["--version"]) do
         {:ok, version} ->
           Mix.shell().info([
             :green,

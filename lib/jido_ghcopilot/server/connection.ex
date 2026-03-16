@@ -109,6 +109,11 @@ defmodule Jido.GHCopilot.Server.Connection do
     GenServer.cast(conn, {:tool_call_response, request_id, result})
   end
 
+  @doc "Respond to an external tool call via session.tools.handlePendingToolCall."
+  def respond_to_external_tool(conn, session_id, request_id, result) do
+    GenServer.call(conn, {:respond_external_tool, session_id, request_id, result}, to_timeout(minute: 5))
+  end
+
   @doc "Stop the connection and terminate the subprocess."
   def stop(conn) do
     GenServer.stop(conn, :normal)
@@ -263,6 +268,22 @@ defmodule Jido.GHCopilot.Server.Connection do
     request = Protocol.set_model_request(id, session_id, model)
     send_to_port(state, request)
     state = put_in(state.pending_requests[id], {:set_model, from})
+    {:noreply, state}
+  end
+
+  def handle_call({:respond_external_tool, session_id, request_id, result}, from, state) do
+    {id, state} = next_id(state)
+
+    request =
+      Jason.encode!(%{
+        jsonrpc: "2.0",
+        id: id,
+        method: "session.tools.handlePendingToolCall",
+        params: %{sessionId: session_id, requestId: request_id, result: result}
+      })
+
+    send_to_port(state, request)
+    state = put_in(state.pending_requests[id], {:respond_external_tool, from})
     {:noreply, state}
   end
 
@@ -543,6 +564,18 @@ defmodule Jido.GHCopilot.Server.Connection do
 
         GenServer.reply(from, reply)
         %{state | pending_requests: pending}
+
+      {{:permission_resolve, _from}, pending} ->
+        if response.error do
+          Logger.warning("Permission resolve failed: #{inspect(response.error)}")
+        end
+
+        %{state | pending_requests: pending}
+
+      {{:respond_external_tool, from}, pending} ->
+        reply = if response.error, do: {:error, response.error}, else: :ok
+        GenServer.reply(from, reply)
+        %{state | pending_requests: pending}
     end
   end
 
@@ -552,12 +585,25 @@ defmodule Jido.GHCopilot.Server.Connection do
     session_id = event.session_id
 
     outcome = resolve_permission(state.permission_handler, %{kind: kind, session_id: session_id, data: data})
-    Logger.debug("Permission event: #{kind} for session #{session_id}, outcome: #{outcome}")
+    Logger.debug("Permission event: #{kind} for session #{session_id}, requestId: #{request_id}, outcome: #{outcome}")
 
-    if request_id && outcome == :approved do
-      response = Protocol.encode_response(request_id, %{"result" => %{"kind" => "approved"}})
-      send_to_port(state, response)
-    end
+    state =
+      if request_id && outcome == :approved do
+        {id, state} = next_id(state)
+
+        request =
+          Jason.encode!(%{
+            jsonrpc: "2.0",
+            id: id,
+            method: "session.permissions.handlePendingPermissionRequest",
+            params: %{sessionId: session_id, requestId: request_id, result: %{kind: "approved"}}
+          })
+
+        send_to_port(state, request)
+        put_in(state.pending_requests[id], {:permission_resolve, nil})
+      else
+        state
+      end
 
     # Forward to subscribers so the UI can show the event
     case Map.get(state.subscribers, session_id, []) do

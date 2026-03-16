@@ -15,7 +15,7 @@ programmatic access:
 | **Transport** | Newline-delimited JSON | LSP Content-Length framing |
 | **Event delivery** | Curated `session/update` (8 types) | Raw `session.event` (27+ types) |
 | **Usage/tokens** | ❌ Not available | ✅ `assistant.usage` events |
-| **Permission model** | Client-driven (`session/request_permission`) | Auto-approve (no callback) |
+| **Permission model** | Client-driven (`session/request_permission`) | Bidirectional (`permission.request` + `permission.requested` events) |
 | **Prompt lifecycle** | Blocking (`session/prompt` returns on completion) | Fire-and-forget (`session.send` returns `messageId`, completion via `session.idle`) |
 | **Visibility** | Documented in ACP spec | Hidden flag (`hideHelp()` in Commander.js) |
 
@@ -353,44 +353,141 @@ the JSON schema. They appear to be dynamically emitted:
 | **Turn boundary detection** | `assistant.turn_start` / `assistant.turn_end` + `session.idle` |
 | **Full session persistence** | `session.getMessages` returns all non-ephemeral events |
 | **Custom agent tracking** | `custom_agent.*` events |
+| **Interactive permission prompts** | `permission.request` requests + `permission.requested` events (v0.0.421+) |
+| **External tool calls** | Register tools in `session.create`, handle `tool.call` requests |
 
 ### What You Cannot Build ❌
 
 | Feature | Why | Workaround |
 |---|---|---|
-| **Interactive permission prompts** | Server mode does not set `requestPermission` callback — all tools auto-approve | Use `--allow-all-tools` (already required) or patch CLI |
-| **Selective tool approval** | No mechanism to intercept tool execution | Accept auto-approve or use ACP protocol (loses usage data) |
 | **Usage data on session resume** | `assistant.usage` is ephemeral — not replayed | Persist usage events yourself during live sessions |
 
-### The Permission Gap in Detail
+### Permission Handling (v0.0.421+)
 
-In the CLI's interactive terminal, when a tool requires confirmation, the
-session calls its `requestPermission` callback, which shows a prompt like
-"Run shell command `rm -rf /tmp/foo`? [y/n]".
+Starting with v0.0.421, the Server protocol supports full bidirectional
+permission handling. Pass `requestPermission: true` in `session.create` or
+`session.resume` to opt in. The CLI then sends permission checks via **two
+paths**, both of which must be handled:
 
-The **ACP protocol** implements this — it sends `session/request_permission`
-as a JSON-RPC request back to the client, blocking until the client responds.
-This enables client-driven approval UIs.
+**Path 1: JSON-RPC request** — `permission.request`
 
-The **Server protocol** does not set a `requestPermission` callback when
-creating sessions:
+The CLI sends a standard JSON-RPC request with an `id`. The client responds
+directly:
 
-```javascript
-// From Session constructor (index.js):
-permissions: this.requestPermission
-  ? { requestRequired: true, request: this.requestPermission }
-  : { requestRequired: false }
-// Server mode: requestPermission is undefined → auto-approve
+```json
+// CLI → client
+{"jsonrpc": "2.0", "id": 42, "method": "permission.request",
+ "params": {"sessionId": "...", "permissionRequest": {"kind": "write", ...}}}
+
+// client → CLI (double-nested result!)
+{"jsonrpc": "2.0", "id": 42, "result": {"result": {"kind": "approved"}}}
 ```
 
-This means in server mode, every tool executes without asking. For a LiveView
-terminal, you'd need to either:
+**Path 2: Session event** — `permission.requested`
 
-1. **Accept auto-approve** — use `--allow-all-tools` (what we do now)
-2. **Patch the CLI** — inject a `requestPermission` callback that sends a
-   custom notification to the client and blocks until the client responds
-3. **Dual protocol** — use ACP for the permission flow and Server for usage
-   data (complex, two separate subprocesses)
+The CLI emits a `permission.requested` event via the `session.event`
+notification channel. This event contains a `requestId` that must be
+resolved via the `session.permissions.handlePendingPermissionRequest` RPC:
+
+```json
+// CLI → client (notification, no id)
+{"jsonrpc": "2.0", "method": "session.event",
+ "params": {"sessionId": "...", "event": {
+   "type": "permission.requested",
+   "data": {"requestId": "req-uuid", "permissionRequest": {"kind": "write", ...}}}}}
+
+// client → CLI (new RPC call)
+{"jsonrpc": "2.0", "id": 43,
+ "method": "session.permissions.handlePendingPermissionRequest",
+ "params": {"sessionId": "...", "requestId": "req-uuid",
+            "result": {"kind": "approved"}}}
+```
+
+Permission request kinds include: `write`, `read`, `commands` (shell), `url`,
+`mcp`, `custom-tool`.
+
+In our implementation, `Jido.GHCopilot.Server.Connection` handles both paths
+and supports three modes via the `:permission_handler` option:
+
+- `:auto_approve` — automatically approve all requests (default)
+- `:deny` — automatically deny all requests
+- `{:callback, fun}` — call `fun.(info)` which must return `:approved` or `:denied`
+
+### External Tool Calls
+
+The Server protocol supports **external tools** — custom tools registered by
+the client that the LLM can invoke. This enables features like `ask_user`
+(prompting the human for input during a session).
+
+#### Registering External Tools
+
+Pass tool definitions in `session.create` or `session.resume`:
+
+```json
+{"jsonrpc": "2.0", "id": 1, "method": "session.create",
+ "params": {
+   "model": "claude-sonnet-4",
+   "requestPermission": true,
+   "tools": [{
+     "name": "ask_user",
+     "description": "Ask the user a question and wait for their response",
+     "parameters": {
+       "type": "object",
+       "properties": {
+         "question": {"type": "string", "description": "The question to ask"}
+       },
+       "required": ["question"]
+     }
+   }]
+ }}
+```
+
+#### Handling Tool Calls
+
+When the LLM invokes an external tool, the CLI sends a `tool.call` JSON-RPC
+**request** (with an `id`) back to the client:
+
+```json
+// CLI → client (request — must respond!)
+{"jsonrpc": "2.0", "id": 99, "method": "tool.call",
+ "params": {
+   "sessionId": "...",
+   "toolCallId": "tc-uuid",
+   "toolName": "ask_user",
+   "arguments": {"question": "What database should I use?"}
+ }}
+```
+
+The client can respond in two ways:
+
+**Option A: Direct JSON-RPC response** (fire-and-forget)
+
+```json
+{"jsonrpc": "2.0", "id": 99, "result": {"result": "PostgreSQL"}}
+```
+
+**Option B: Via `session.tools.handlePendingToolCall` RPC** (with acknowledgment)
+
+The tool call also emits an `external_tool.requested` session event. The
+client can respond asynchronously via a new RPC call:
+
+```json
+{"jsonrpc": "2.0", "id": 100,
+ "method": "session.tools.handlePendingToolCall",
+ "params": {
+   "sessionId": "...",
+   "requestId": "tc-uuid",
+   "result": "PostgreSQL"
+ }}
+```
+
+Option B is preferred for tools that require user interaction (like `ask_user`)
+because it decouples the response from the original request ID.
+
+In our implementation:
+- `Connection.respond_to_tool_call/3` — Option A (cast, fire-and-forget)
+- `Connection.respond_to_external_tool/4` — Option B (call, waits for ack)
+- Subscribers receive `{:server_tool_call, %{request_id, session_id, tool_call_id, tool_name, arguments}}`
 
 ## Session Persistence & Replay
 
@@ -459,6 +556,11 @@ this protocol:
   via `{:server_event, %SessionEvent{}}` messages
 - **Turn lifecycle**: `send_prompt/5` returns `{:ok, message_id}` immediately;
   callers wait for `session.idle` event
+- **Permission handling**: Handles both `permission.request` JSON-RPC requests
+  and `permission.requested` events; configurable via `:permission_handler`
+- **External tools**: Handles `tool.call` server→client requests, forwards to
+  subscribers as `{:server_tool_call, tool_call}` messages; provides
+  `respond_to_tool_call/3` and `respond_to_external_tool/4` for responses
 
 See `lib/jido_ghcopilot/server/connection.ex` and
 `lib/jido_ghcopilot/server/protocol.ex` for the implementation.

@@ -82,7 +82,7 @@ graph LR
 | Prompt lifecycle | Blocking (response = turn complete) | Fire-and-forget + `session.idle` |
 | Token usage | ❌ Not available | ✅ `assistant.usage` events |
 | Cost/quota data | ❌ | ✅ Premium multiplier, quota snapshots |
-| Permission model | Bidirectional (server asks, client responds) | Unidirectional (auto-approve or `permission.request`) |
+| Permission model | Bidirectional (server asks, client responds) | Bidirectional (`permission.request` + `permission.requested` events) |
 | Session management | `session/new`, `session/load` | `session.create`, `session.resume`, `session.destroy`, `session.list` |
 | Hidden flag | No (`--acp` is in `--help`) | Yes (hidden via `hideHelp()` in Commander.js) |
 
@@ -376,8 +376,11 @@ Sonnet, `3` for Opus, `0.33` for Haiku.
 
 ### Permission Handling in Server Mode
 
-In versions ≥0.0.421, the Server protocol supports a `permission.request`
-callback when you set `requestPermission: true` in `session.create`:
+In versions ≥0.0.421, the Server protocol supports bidirectional permission
+handling when you set `requestPermission: true` in `session.create`. The CLI
+uses **two paths** — both must be handled:
+
+**Path 1: JSON-RPC request** (`permission.request`)
 
 ```mermaid
 sequenceDiagram
@@ -385,15 +388,65 @@ sequenceDiagram
     participant C as Client
 
     S->>C: permission.request (JSON-RPC request)
-    Note left of S: {sessionId, permissionRequest:<br/>{kind: "tool_execution",<br/>toolName: "shell", ...}}
+    Note left of S: {sessionId, permissionRequest:<br/>{kind: "write",<br/>intention: "Create file", ...}}
     C-->>S: response
-    Note right of C: {result: {kind: "approved"}}
+    Note right of C: {result: {result: {kind: "approved"}}}
     Note over C: ⚠️ Double-nested result!
 ```
 
 Note the double-nested `result`—the CLI's `dispatchPermissionRequest` does
 `(await sendRequest(...)).result`, so the actual outcome must be nested inside
 a `result` key.
+
+**Path 2: Session event** (`permission.requested`)
+
+The CLI may also emit a `permission.requested` event via `session.event`
+notification. This requires responding via a separate RPC method:
+
+```mermaid
+sequenceDiagram
+    participant S as Server
+    participant C as Client
+
+    S-)C: session.event (permission.requested)
+    Note left of S: event.data.requestId = "req-uuid"
+
+    C->>S: session.permissions.handlePendingPermissionRequest
+    Note right of C: {sessionId, requestId: "req-uuid",<br/>result: {kind: "approved"}}
+    S-->>C: response (ack)
+```
+
+### External Tool Calls
+
+The Server protocol supports external tools — custom tools registered by the
+client that the LLM can invoke (e.g., `ask_user` for prompting the human).
+
+Register tools in `session.create` via the `tools` parameter, then handle
+`tool.call` JSON-RPC requests from the server:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    C->>S: session.create (with tools: [...])
+    S-->>C: {sessionId}
+
+    C->>S: session.send (prompt)
+
+    Note over S: LLM decides to call external tool
+
+    S->>C: tool.call (JSON-RPC request)
+    Note left of S: {toolName: "ask_user",<br/>arguments: {question: "..."},<br/>toolCallId: "tc-uuid"}
+
+    Note over C: Execute tool<br/>(e.g., show UI, wait for user)
+
+    C-->>S: response (tool result)
+    Note right of C: {result: "user's answer"}
+```
+
+Alternatively, respond via `session.tools.handlePendingToolCall` RPC for
+asynchronous tool execution (preferred for interactive tools).
 
 ### Additional Server-Only Methods
 
@@ -585,6 +638,7 @@ end
 | Multi-turn with blocking calls | ACP (`--acp --stdio`) |
 | Token usage and cost tracking | Server (`--server --stdio`) |
 | Interactive permission prompts | ACP (native) or Server (with `requestPermission: true`) |
+| External tool calls (ask_user) | Server (`tool.call` + `session.tools.handlePendingToolCall`) |
 | Session management (list, delete) | Server |
 | Easiest to implement | ACP (NDJSON is simpler than Content-Length framing) |
 | Richest event stream | Server (27+ event types vs ~8) |
@@ -681,9 +735,10 @@ To build your own harness for either protocol:
 3. **Send the init handshake** (`initialize` for ACP, `ping` for Server)
 4. **Manage request IDs** — monotonic counter, map of `id → callback`
 5. **Route notifications** — parse `session/update` (ACP) or `session.event` (Server) and fan out to subscribers
-6. **Handle server→client requests** — `session/request_permission` (ACP) or `permission.request` (Server)
-7. **Detect turn completion** — wait for RPC response (ACP) or `session.idle` event (Server)
-8. **Clean up on subprocess exit** — fail all pending requests, notify subscribers
+6. **Handle server→client requests** — `session/request_permission` (ACP) or `permission.request` + `tool.call` (Server)
+7. **Handle external tools** (Server) — respond to `tool.call` requests via direct response or `session.tools.handlePendingToolCall`
+8. **Detect turn completion** — wait for RPC response (ACP) or `session.idle` event (Server)
+9. **Clean up on subprocess exit** — fail all pending requests, notify subscribers
 
 The JSON-RPC 2.0 envelope is identical in both protocols:
 

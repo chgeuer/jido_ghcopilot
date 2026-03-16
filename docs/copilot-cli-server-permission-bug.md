@@ -60,16 +60,61 @@ must respond to with `{kind: "approved"}`.
 
 **Response** (client → CLI):
 ```json
-{"jsonrpc": "2.0", "id": 42, "result": {"kind": "approved"}}
+{"jsonrpc": "2.0", "id": 42, "result": {"result": {"kind": "approved"}}}
 ```
 
+Note the double-nested `result`—the CLI's `dispatchPermissionRequest` does
+`(await sendRequest(...)).result`, so the outcome must be nested inside a
+`result` key within the JSON-RPC result.
+
 Permission request kinds include: `write`, `read`, `commands` (shell), `url`, `mcp`, `custom-tool`.
+
+### Event-based permission path
+
+In addition to `permission.request` JSON-RPC requests, the CLI also emits
+`permission.requested` as a `session.event` notification. This event contains
+a `requestId` that must be resolved via a separate RPC method:
+
+**Event** (CLI → client, as `session.event` notification):
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "session.event",
+  "params": {
+    "sessionId": "...",
+    "event": {
+      "type": "permission.requested",
+      "data": {
+        "requestId": "req-uuid",
+        "permissionRequest": {"kind": "write", "intention": "Create file", ...}
+      }
+    }
+  }
+}
+```
+
+**Resolution** (client → CLI, new RPC call):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 43,
+  "method": "session.permissions.handlePendingPermissionRequest",
+  "params": {
+    "sessionId": "...",
+    "requestId": "req-uuid",
+    "result": {"kind": "approved"}
+  }
+}
+```
+
+Both paths must be handled — the CLI may use either depending on the context.
 
 ### Implementation in jido_ghcopilot
 
 `Jido.GHCopilot.Server.Connection` now:
 1. Passes `requestPermission: true` in all `session.create` and `session.resume` requests
 2. Auto-approves all `permission.request` JSON-RPC requests from the CLI
+3. Auto-approves all `permission.requested` session events via `session.permissions.handlePendingPermissionRequest`
 
 This restores full tool execution (file create/edit, bash, URL fetch) while keeping
 the Server protocol's advantages: usage tracking, external tool calls, model switching,

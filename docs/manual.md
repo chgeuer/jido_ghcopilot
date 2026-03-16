@@ -117,26 +117,21 @@ Events arrive as Erlang messages to the subscribed process:
 ```elixir
 def handle_info({:server_event, %{type: type, data: data}}, state) do
   case type do
-    "assistant.message.chunk" ->
-      # Streaming text chunk
-      text = data["chunkContent"] || ""
-      IO.write(text)
+    "assistant.message" ->
+      # Streaming text chunk or full message
+      chunk = data["chunkContent"]
+      if chunk, do: IO.write(chunk)
 
-    "assistant.thought.chunk" ->
-      # Thinking/reasoning chunk
-      thought = data["chunkContent"] || ""
-      Logger.debug("Thinking: #{thought}")
-
-    "assistant.message.complete" ->
-      # Full message assembled
-      full_text = data["content"]
-      IO.puts("\n\nComplete: #{full_text}")
+    "assistant.intent" ->
+      # Thinking/reasoning content
+      intent = data["intent"] || ""
+      Logger.debug("Thinking: #{intent}")
 
     "tool.execution_start" ->
       Logger.info("Tool: #{data["toolName"]}")
 
     "tool.execution_complete" ->
-      Logger.info("Tool done: #{data["toolName"]}")
+      Logger.info("Tool done: success=#{data["success"]}")
 
     "assistant.usage" ->
       # Token usage and cost
@@ -157,20 +152,29 @@ end
 
 ### Responding to Tool Calls
 
-If you registered custom tools, Copilot may call them:
+If you registered custom tools, Copilot may call them. Subscribers receive
+`{:server_tool_call, tool_call}` messages:
 
 ```elixir
 def handle_info({:server_tool_call, tool_call}, state) do
   result = case tool_call.tool_name do
-    "my_tool" ->
-      # Execute your tool logic
-      %{"result" => "tool output"}
+    "ask_user" ->
+      # Execute your tool logic (e.g., prompt the user)
+      "The user said: PostgreSQL"
 
     _ ->
       %{"error" => "Unknown tool: #{tool_call.tool_name}"}
   end
 
+  # Option A: Fire-and-forget (responds directly to the JSON-RPC request)
   Connection.respond_to_tool_call(state.conn, tool_call.request_id, result)
+
+  # Option B: With acknowledgment (uses session.tools.handlePendingToolCall RPC)
+  # Preferred for interactive tools like ask_user
+  Connection.respond_to_external_tool(
+    state.conn, tool_call.session_id, tool_call.tool_call_id, result
+  )
+
   {:noreply, state}
 end
 ```
@@ -243,7 +247,7 @@ defmodule MyApp.CopilotSession do
   end
 
   @impl true
-  def handle_info({:server_event, %{type: "assistant.message.chunk", data: data}}, state) do
+  def handle_info({:server_event, %{type: "assistant.message", data: data}}, state) do
     chunk = data["chunkContent"] || ""
     {:noreply, %{state | text_buffer: state.text_buffer <> chunk}}
   end
@@ -257,10 +261,10 @@ defmodule MyApp.CopilotSession do
   def handle_info({:server_event, _event}, state), do: {:noreply, state}
 
   def handle_info({:server_tool_call, tool_call}, state) do
-    # Auto-deny any tool calls in this simple example
-    Connection.respond_to_tool_call(state.conn, tool_call.request_id, %{
-      "error" => "No tools available"
-    })
+    # Respond to any tool calls (deny in this simple example)
+    Connection.respond_to_external_tool(
+      state.conn, tool_call.session_id, tool_call.tool_call_id, "No tools available"
+    )
     {:noreply, state}
   end
 
@@ -287,14 +291,19 @@ Events received after subscribing (`{:server_event, %{type: type, data: data}}`)
 
 | Type | Description | Key Data Fields |
 |------|-------------|-----------------|
-| `assistant.message.chunk` | Streaming text chunk | `chunkContent` |
-| `assistant.message.complete` | Full assembled message | `content` |
-| `assistant.thought.chunk` | Thinking/reasoning chunk | `chunkContent` |
-| `assistant.turn_start` | Assistant begins responding | — |
-| `assistant.usage` | Token usage & cost | `model`, `inputTokens`, `outputTokens`, `cost` |
-| `tool.execution_start` | Tool begins executing | `toolName` |
-| `tool.execution_complete` | Tool finished | `toolName`, `result`, `error` |
+| `assistant.message` | Model output (streaming chunks and final) | `chunkContent` (incremental), `content` (full) |
+| `assistant.intent` | Thinking/reasoning content | `intent` |
+| `assistant.turn_start` | Assistant begins responding | `turnId` |
+| `assistant.turn_end` | Assistant finished responding | `turnId` |
+| `assistant.usage` | Token usage & cost (ephemeral) | `model`, `inputTokens`, `outputTokens`, `cost` |
+| `tool.execution_start` | Tool begins executing | `toolCallId`, `toolName`, `arguments` |
+| `tool.execution_partial_result` | Streaming tool output (ephemeral) | `toolCallId`, `partialOutput` |
+| `tool.execution_complete` | Tool finished | `toolCallId`, `success`, `result`, `error` |
+| `permission.requested` | Permission check required | `requestId`, `permissionRequest` |
 | `session.idle` | Turn complete, ready for next prompt | — |
+| `session.start` | Session created | `sessionId`, `selectedModel` |
+| `session.resume` | Session resumed | `resumeTime`, `eventCount` |
+| `session.error` | Session error | `errorType`, `message` |
 | `user.message` | Echo of sent user message | `content` |
 
 ## Available Models
@@ -321,7 +330,7 @@ mix ghcopilot.models --search claude
 
 3. **Accumulate chunks.** Text arrives in small chunks via `assistant.message.chunk`. Buffer them until `session.idle`.
 
-4. **Tool calls block the session.** If Copilot calls an external tool, you MUST respond via `respond_to_tool_call/3` or the session hangs.
+4. **Tool calls block the session.** If Copilot calls an external tool, you MUST respond via `respond_to_external_tool/4` or `respond_to_tool_call/3`, or the session hangs.
 
 5. **One session = one conversation thread.** Create new sessions for independent conversations. Use `resume_session/3` to continue a previous one.
 

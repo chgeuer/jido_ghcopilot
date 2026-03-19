@@ -2,13 +2,19 @@ defmodule Jido.GHCopilot do
   @moduledoc """
   GitHub Copilot CLI adapter for Jido.Harness.
 
-  This package provides two integration modes:
+  This package provides three integration modes:
+
+  ## CLI Server mode (recommended)
+  Use `Jido.GHCopilot.Server.Connection` directly for the richest feature set:
+  27+ event types, token usage & cost tracking, mid-session model switching,
+  session listing, and external tool call handling.
 
   ## Simple mode (backward-compatible)
   - `run/2` — single prompt, returns event stream
   - `cancel/1` — cancel active session
 
-  ## Agent mode (ACP-based, on-par with jido_claude)
+  ## ACP mode (legacy)
+  Supported but not recommended for new integrations. Prefer CLI Server mode.
   - `start_session/1` — start a long-lived ACP session
   - `send_prompt/4` — send a prompt to an existing session
   - `cancel_session/2` — cancel a session
@@ -144,7 +150,7 @@ defmodule Jido.GHCopilot do
   @spec cancel(String.t()) :: :ok | {:error, term()}
   def cancel(session_id), do: adapter_module().cancel(session_id)
 
-  # ── Agent Mode (ACP-based) ──
+  # ── ACP Mode (legacy — prefer Server.Connection for new integrations) ──
 
   @doc """
   Start a new ACP connection and session.

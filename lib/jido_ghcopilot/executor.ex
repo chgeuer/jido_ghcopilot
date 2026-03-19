@@ -2,10 +2,14 @@ defmodule Jido.GHCopilot.Executor do
   @moduledoc """
   Behaviour for executing GitHub Copilot CLI sessions.
 
-  Two implementations are provided:
+  Three implementations are provided:
 
+  - `Jido.GHCopilot.Executor.Server` — CLI Server protocol over stdio JSON-RPC.
+    **Recommended.** Provides 27+ event types, token usage & cost tracking,
+    mid-session model switching, and external tool call handling.
   - `Jido.GHCopilot.Executor.ACP` — ACP (Agent Client Protocol) over stdio JSON-RPC.
-    Supports multi-turn sessions, thinking streams, and structured tool calls.
+    Legacy protocol. Supports multi-turn sessions, thinking streams, and
+    structured tool calls but lacks usage data and advanced session management.
   - `Jido.GHCopilot.Executor.Port` — Direct Port-based CLI execution.
     Simpler, single-prompt mode with line-based output streaming.
 

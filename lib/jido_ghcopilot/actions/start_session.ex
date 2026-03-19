@@ -2,9 +2,12 @@ defmodule Jido.GHCopilot.Actions.StartSession do
   @moduledoc """
   Initializes a GitHub Copilot session using a pluggable executor.
 
-  By default uses the ACP executor. Override via `:target` option:
+  By default uses the CLI Server executor, which provides the richest feature
+  set (27+ event types, token usage tracking, mid-session model switching).
+  Override via `:target` option:
 
-  - `:acp` — ACP JSON-RPC over stdio (default, full features)
+  - `:server` — CLI Server JSON-RPC over stdio (default, recommended)
+  - `:acp` — ACP JSON-RPC over stdio (legacy, fewer event types)
   - `:port` — direct Port-based CLI execution (simple, single-prompt)
   """
 
@@ -18,7 +21,7 @@ defmodule Jido.GHCopilot.Actions.StartSession do
       mcp_servers: [type: {:list, :any}, default: []],
       timeout_ms: [type: :integer, default: to_timeout(minute: 10)],
       cli_args: [type: {:list, :string}, default: []],
-      target: [type: :atom, default: :acp],
+      target: [type: :atom, default: :server],
       allow_all_tools: [type: :boolean, default: false],
       allow_all_paths: [type: :boolean, default: false],
       allow_all_urls: [type: :boolean, default: false],

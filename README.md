@@ -33,29 +33,11 @@ Jido.GHCopilot.cli_installed?()
 Jido.GHCopilot.compatible?()
 ```
 
-### Simple mode — single prompt
+### CLI Server mode — multi-turn sessions (recommended)
 
-```elixir
-{:ok, events} = Jido.GHCopilot.run("Summarize this repository")
-Enum.each(events, &IO.inspect/1)
-```
-
-### ACP mode — multi-turn sessions
-
-```elixir
-{:ok, conn, session_id} = Jido.GHCopilot.start_session(model: "claude-sonnet-4.6")
-:ok = Jido.GHCopilot.subscribe(conn, session_id)
-{:ok, :end_turn} = Jido.GHCopilot.send_prompt(conn, session_id, "Explain the auth module")
-
-# Receive updates as {:acp_update, session_update} messages
-receive do
-  {:acp_update, update} -> IO.inspect(update)
-end
-
-Jido.GHCopilot.stop_session(conn)
-```
-
-### CLI Server mode — with token usage data
+The CLI Server protocol is the **recommended** integration mode. It provides the
+richest feature set: 27+ event types, token usage & cost tracking, mid-session model
+switching, session listing, and external tool call handling.
 
 ```elixir
 alias Jido.GHCopilot.Server.Connection
@@ -73,40 +55,78 @@ end
 Connection.stop(conn)
 ```
 
+### Simple mode — single prompt
+
+```elixir
+{:ok, events} = Jido.GHCopilot.run("Summarize this repository")
+Enum.each(events, &IO.inspect/1)
+```
+
+### ACP mode — multi-turn sessions (legacy)
+
+ACP mode is still supported but provides fewer event types and no usage data.
+Prefer CLI Server mode for new integrations.
+
+```elixir
+{:ok, conn, session_id} = Jido.GHCopilot.start_session(model: "claude-sonnet-4.6")
+:ok = Jido.GHCopilot.subscribe(conn, session_id)
+{:ok, :end_turn} = Jido.GHCopilot.send_prompt(conn, session_id, "Explain the auth module")
+
+# Receive updates as {:acp_update, session_update} messages
+receive do
+  {:acp_update, update} -> IO.inspect(update)
+end
+
+Jido.GHCopilot.stop_session(conn)
+```
+
 ## Three Execution Modes
 
-### 1. Simple/Port mode
+### 1. CLI Server mode (recommended)
 
-Spawns `copilot -p <prompt>` as an Erlang Port. Streams line-based output through `Mapper` into `Jido.Harness.Event` structs using `Stream.resource/3`. Single-prompt, fire-and-forget.
+Spawns `copilot --server --stdio` as a long-lived Port. Communicates via JSON-RPC 2.0 with LSP-style `Content-Length` framing. Uses dot-separated method names (`session.create`, `session.send`).
+
+This is the **recommended protocol** for new integrations. It provides the richest
+feature set of all three modes:
+
+- **27+ event types** — full visibility into session lifecycle, tool execution, permissions, and custom agents
+- **Token usage & cost tracking** — `assistant.usage` events with input/output token counts, cache stats, cost, and quota
+- **Mid-session model switching** — change the model without losing conversation context
+- **Session management** — list, destroy, and resume sessions
+- **External tool calls** — register custom tools and handle tool call requests
+- **Fire-and-forget prompts** — `send_prompt/5` returns a `message_id` immediately; completion is signaled via `session.idle` events
+
+Subscribers receive `{:server_event, session_event}` messages. Optionally uses a Node.js wrapper (`priv/copilot_wrapper/index.js`) for extended features like context-preserving model switching via `session.setModel`.
+
+**Entry points:** `Jido.GHCopilot.Server.Connection`
+
+### 2. Simple/Port mode
+
+Spawns `copilot -p <prompt>` as an Erlang Port. Streams line-based output through `Mapper` into `Jido.Harness.Event` structs using `Stream.resource/3`. Single-prompt, fire-and-forget. Useful for quick one-off prompts where session management is not needed.
 
 **Entry points:** `Jido.GHCopilot.run/2`, `Jido.GHCopilot.run_request/2`
 
-### 2. ACP mode (Agent Client Protocol)
+### 3. ACP mode (Agent Client Protocol, legacy)
 
 Spawns `copilot --acp --stdio` as a long-lived Port. Communicates via JSON-RPC 2.0 over stdin/stdout with newline-delimited JSON (NDJSON). Supports multi-turn sessions, thinking streams, tool calls, and session resume. Uses slash-separated method names (`session/new`, `session/prompt`).
+
+ACP provides curated update types but lacks token usage data, cost tracking, session listing, and mid-session model switching. **Prefer CLI Server mode for new integrations.**
 
 Subscribers receive `{:acp_update, session_update}` messages with curated update types:
 `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `user_message_chunk`.
 
 **Entry points:** `Jido.GHCopilot.start_session/1`, `send_prompt/4`, `subscribe/2`, `resume_session/3`
 
-### 3. CLI Server mode
-
-Spawns `copilot --server --stdio` as a long-lived Port. Communicates via JSON-RPC 2.0 with LSP-style `Content-Length` framing (not NDJSON). Uses dot-separated method names (`session.create`, `session.send`).
-
-Provides the same multi-turn capabilities as ACP but additionally surfaces **token usage, cost, and quota data** via raw `session.event` notifications (27+ event types including `assistant.usage`).
-
-Subscribers receive `{:server_event, session_event}` messages. Optionally uses a Node.js wrapper (`priv/copilot_wrapper/index.js`) for extended features like context-preserving model switching via `session.setModel`.
-
-**Entry points:** `Jido.GHCopilot.Server.Connection`
-
 ## Agent Mode
 
-For Jido agent integration, `SessionAgent` provides a signal-driven state machine that mirrors `jido_claude`'s pattern. The `StartSession` action accepts a `:target` option to select the executor:
+For Jido agent integration, `SessionAgent` provides a signal-driven state machine that mirrors `jido_claude`'s pattern. The `StartSession` action uses the CLI Server executor by default. Override via `:target`:
 
 ```elixir
-# :acp (default), :port, or :server
-{Jido.GHCopilot.Actions.StartSession, %{prompt: "Fix the bug", target: :server}}
+# :server (default, recommended), :acp, or :port
+{Jido.GHCopilot.Actions.StartSession, %{prompt: "Fix the bug"}}
+
+# Explicitly select a different executor
+{Jido.GHCopilot.Actions.StartSession, %{prompt: "Fix the bug", target: :acp}}
 ```
 
 ### Agent actions
@@ -139,13 +159,25 @@ Signals use `Jido.Signal` with `type: "ghcopilot.<category>.<name>"` naming:
 | `ghcopilot.turn.plan` | Agent's structured plan |
 | `ghcopilot.turn.usage` | Token/cost usage metrics |
 
+## CLI Server Mode API (recommended)
+
+- `Server.Connection.start_link/1` — start a connection
+- `Server.Connection.create_session/3` — create a session (supports model, system message, tool config)
+- `Server.Connection.send_prompt/5` — send a prompt (fire-and-forget, returns `message_id`)
+- `Server.Connection.subscribe/2` / `unsubscribe/2` — event subscriptions
+- `Server.Connection.resume_session/4` / `destroy_session/3` — session lifecycle
+- `Server.Connection.list_sessions/2` — list all sessions
+- `Server.Connection.set_model/4` — change model mid-session (requires Node.js wrapper)
+- `Server.Connection.respond_to_tool_call/3` — respond to tool call requests
+- `Server.Connection.respond_to_external_tool/4` — handle external tool calls
+
 ## Simple Mode API
 
 - `Jido.GHCopilot.run/2` — run a prompt, returns `{:ok, event_stream}`
 - `Jido.GHCopilot.run_request/2` — run a pre-built `%Jido.Harness.RunRequest{}`
 - `Jido.GHCopilot.cancel/1` — cancel by session id
 
-## ACP Mode API
+## ACP Mode API (legacy)
 
 - `Jido.GHCopilot.start_session/1` — returns `{:ok, conn, session_id}`
 - `Jido.GHCopilot.send_prompt/4` — returns `{:ok, stop_reason}`
@@ -153,16 +185,6 @@ Signals use `Jido.Signal` with `type: "ghcopilot.<category>.<name>"` naming:
 - `Jido.GHCopilot.resume_session/3` — resume a previous session
 - `Jido.GHCopilot.cancel_session/2` — cancel an ACP session
 - `Jido.GHCopilot.stop_session/1` — stop the connection and subprocess
-
-## CLI Server Mode API
-
-- `Server.Connection.start_link/1` — start a connection
-- `Server.Connection.create_session/3` — create a session (supports model, system message, tool config)
-- `Server.Connection.send_prompt/5` — send a prompt
-- `Server.Connection.subscribe/2` / `unsubscribe/2` — event subscriptions
-- `Server.Connection.resume_session/4` / `destroy_session/3` — session lifecycle
-- `Server.Connection.list_sessions/2` — list all sessions
-- `Server.Connection.set_model/4` — change model mid-session (requires Node.js wrapper)
 
 ## Model Resolution
 

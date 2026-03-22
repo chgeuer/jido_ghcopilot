@@ -8,9 +8,9 @@ defmodule Jido.GHCopilot.Signals.TurnUsage do
       model: [type: :string, required: false],
       input_tokens: [type: :integer, required: false, default: 0],
       output_tokens: [type: :integer, required: false, default: 0],
-      cache_read_tokens: [type: :integer, required: false, default: 0],
-      cache_write_tokens: [type: :integer, required: false, default: 0],
-      cost: [type: :float, required: false],
+      total_tokens: [type: :integer, required: false, default: 0],
+      cached_input_tokens: [type: :integer, required: false, default: 0],
+      cost_usd: [type: :float, required: false],
       duration_ms: [type: :float, required: false]
     ]
 end

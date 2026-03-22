@@ -103,9 +103,9 @@ defmodule Jido.GHCopilot.Actions.HandleMessage do
         model: data[:model],
         input_tokens: data[:input_tokens] || 0,
         output_tokens: data[:output_tokens] || 0,
-        cache_read_tokens: data[:cache_read_tokens] || 0,
-        cache_write_tokens: data[:cache_write_tokens] || 0,
-        cost: data[:cost],
+        total_tokens: data[:total_tokens] || 0,
+        cached_input_tokens: data[:cached_input_tokens] || 0,
+        cost_usd: data[:cost_usd],
         duration_ms: data[:duration_ms]
       })
 

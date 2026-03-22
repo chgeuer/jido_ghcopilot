@@ -171,13 +171,16 @@ defmodule Jido.GHCopilot.Server.StreamRunner do
   end
 
   defp build_update_data(:usage, event) do
+    input = event.data["inputTokens"] || 0
+    output = event.data["outputTokens"] || 0
+
     %{
       model: event.data["model"],
-      input_tokens: event.data["inputTokens"] || 0,
-      output_tokens: event.data["outputTokens"] || 0,
-      cache_read_tokens: event.data["cacheReadTokens"] || 0,
-      cache_write_tokens: event.data["cacheWriteTokens"] || 0,
-      cost: event.data["cost"],
+      input_tokens: input,
+      output_tokens: output,
+      total_tokens: input + output,
+      cached_input_tokens: (event.data["cacheReadTokens"] || 0) + (event.data["cacheWriteTokens"] || 0),
+      cost_usd: event.data["cost"],
       duration_ms: event.data["duration"]
     }
   end

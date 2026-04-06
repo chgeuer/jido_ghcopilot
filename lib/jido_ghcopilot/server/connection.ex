@@ -147,13 +147,14 @@ defmodule Jido.GHCopilot.Server.Connection do
       permission_handler: permission_handler
     }
 
-    # Verify the server is ready
+    # Verify the server is ready (use higher timeout for remote I/O)
+    init_timeout = Keyword.get(opts, :timeout, to_timeout(minute: 2))
     {id, state} = next_id(state)
     request = Protocol.ping_request(id, "init")
     send_to_io(state, request)
     state = put_in(state.pending_requests[id], {:ping, nil})
 
-    case wait_for_init_io(state, @default_timeout) do
+    case wait_for_init_io(state, init_timeout) do
       {:ok, state} ->
         Logger.info("CLI Server connection established (external I/O)")
         {:ok, state}

@@ -147,14 +147,12 @@ defmodule Jido.GHCopilot.Server.Connection do
       permission_handler: permission_handler
     }
 
-    # Verify the server is ready (use higher timeout for remote I/O)
+    # The remote server may take time to initialize (Node.js startup, native
+    # addon extraction, etc.). Retry the ping with increasing delays rather
+    # than sending it once and hoping.
     init_timeout = Keyword.get(opts, :timeout, to_timeout(minute: 2))
-    {id, state} = next_id(state)
-    request = Protocol.ping_request(id, "init")
-    send_to_io(state, request)
-    state = put_in(state.pending_requests[id], {:ping, nil})
 
-    case wait_for_init_io(state, init_timeout) do
+    case ping_with_retry(state, init_timeout) do
       {:ok, state} ->
         Logger.info("CLI Server connection established (external I/O)")
         {:ok, state}
@@ -162,6 +160,35 @@ defmodule Jido.GHCopilot.Server.Connection do
       {:error, reason} ->
         Logger.error("CLI Server init failed (external I/O): #{inspect(reason)}")
         {:stop, :init_timeout}
+    end
+  end
+
+  defp ping_with_retry(state, total_timeout, attempt \\ 1) do
+    delays = [2_000, 5_000, 10_000, 15_000, 20_000, 30_000]
+    delay = Enum.at(delays, min(attempt - 1, length(delays) - 1))
+
+    # Wait before sending ping (let server initialize)
+    Process.sleep(delay)
+
+    {id, state} = next_id(state)
+    request = Protocol.ping_request(id, "init-#{attempt}")
+    send_to_io(state, request)
+    state = put_in(state.pending_requests[id], {:ping, nil})
+
+    remaining = max(total_timeout - (delay + 5_000), 5_000)
+
+    case wait_for_init_io(state, min(remaining, 15_000)) do
+      {:ok, state} ->
+        {:ok, state}
+
+      {:error, :timeout} when remaining > 10_000 ->
+        # Drain the failed pending request and retry
+        state = %{state | pending_requests: %{}}
+        Logger.info("CLI Server ping attempt #{attempt} timed out, retrying...")
+        ping_with_retry(state, remaining, attempt + 1)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

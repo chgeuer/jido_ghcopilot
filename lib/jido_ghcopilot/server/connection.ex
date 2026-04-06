@@ -31,6 +31,9 @@ defmodule Jido.GHCopilot.Server.Connection do
   defstruct [
     :port,
     :port_pid,
+    :io_socket,
+    :io_reader,
+    :init_timeout,
     buffer: <<>>,
     next_id: 1,
     pending_requests: %{},
@@ -45,7 +48,19 @@ defmodule Jido.GHCopilot.Server.Connection do
 
   @doc "Start a new CLI Server connection."
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: opts[:name])
+    socket = Keyword.get(opts, :io)
+
+    case GenServer.start_link(__MODULE__, opts, name: opts[:name]) do
+      {:ok, pid} = ok ->
+        if socket do
+          :gen_tcp.controlling_process(socket, pid)
+          GenServer.cast(pid, :start_io_reader_and_init)
+        end
+        ok
+
+      error ->
+        error
+    end
   end
 
   @doc "Ping the server. Returns `{:ok, response}` or `{:error, reason}`."
@@ -123,6 +138,62 @@ defmodule Jido.GHCopilot.Server.Connection do
 
   @impl true
   def init(opts) do
+    case Keyword.get(opts, :io) do
+      nil -> init_spawn_local(opts)
+      socket -> init_with_io(socket, opts)
+    end
+  end
+
+  # Connect to an already-running agent via a pre-connected bidirectional
+  # byte stream (e.g. a Unix Domain Socket from Firecracker vsock).
+  # The caller is responsible for starting the agent process — this just
+  # attaches to its stdio via the given socket.
+  defp init_with_io(socket, opts) do
+    permission_handler = Keyword.get(opts, :permission_handler, :auto_approve)
+    init_timeout = Keyword.get(opts, :timeout, to_timeout(minute: 2))
+
+    state = %__MODULE__{
+      io_socket: socket,
+      permission_handler: permission_handler,
+      init_timeout: init_timeout
+    }
+
+    # Reader and init ping are deferred to :start_io_reader_and_init cast
+    # (sent from start_link after socket ownership is transferred)
+    {:ok, state}
+  end
+
+  defp ping_with_retry(state, total_timeout, attempt \\ 1) do
+    delays = [2_000, 5_000, 10_000, 15_000, 20_000, 30_000]
+    delay = Enum.at(delays, min(attempt - 1, length(delays) - 1))
+
+    # Wait before sending ping (let server initialize)
+    Process.sleep(delay)
+
+    {id, state} = next_id(state)
+    request = Protocol.ping_request(id, "init-#{attempt}")
+    send_to_io(state, request)
+    state = put_in(state.pending_requests[id], {:ping, nil})
+
+    remaining = max(total_timeout - (delay + 5_000), 5_000)
+
+    case wait_for_init_io(state, min(remaining, 15_000)) do
+      {:ok, state} ->
+        {:ok, state}
+
+      {:error, :timeout} when remaining > 10_000 ->
+        # Drain the failed pending request and retry
+        state = %{state | pending_requests: %{}}
+        Logger.info("CLI Server ping attempt #{attempt} timed out, retrying...")
+        ping_with_retry(state, remaining, attempt + 1)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Spawn the copilot process locally and connect via Port.
+  defp init_spawn_local(opts) do
     use_wrapper = Keyword.get(opts, :use_wrapper, true)
 
     {executable, args} =
@@ -211,6 +282,28 @@ defmodule Jido.GHCopilot.Server.Connection do
         {:stop, :init_timeout, state}
     end
   end
+
+  @impl true
+  def handle_cast(:start_io_reader_and_init, %{io_socket: socket} = state) when not is_nil(socket) do
+    parent = self()
+
+    reader =
+      spawn_link(fn ->
+        receive do
+          :socket_ready -> io_reader_loop(socket, parent)
+        after
+          10_000 -> :ok
+        end
+      end)
+
+    :gen_tcp.controlling_process(socket, reader)
+    Kernel.send(reader, :socket_ready)
+
+    Logger.info("CLI Server connection established (external I/O, reader started)")
+    {:noreply, %{state | io_reader: reader}}
+  end
+
+  def handle_cast(:start_io_reader_and_init, state), do: {:noreply, state}
 
   @impl true
   def handle_call({:ping, message}, from, state) do
@@ -316,20 +409,28 @@ defmodule Jido.GHCopilot.Server.Connection do
     {:noreply, state}
   end
 
+  # Data from external I/O socket (reader process forwards it)
+  def handle_info({:io_data, data}, %{io_socket: sock} = state) when not is_nil(sock) do
+    state = %{state | buffer: state.buffer <> data}
+    state = process_lsp_buffer(state)
+    {:noreply, state}
+  end
+
+  def handle_info(:io_closed, %{io_socket: _} = state) do
+    Logger.warning("CLI Server I/O connection closed")
+    fail_pending_requests(state)
+    {:stop, :normal, %{state | io_socket: nil, pending_requests: %{}}}
+  end
+
+  def handle_info({:io_error, reason}, %{io_socket: _} = state) do
+    Logger.error("CLI Server I/O error: #{inspect(reason)}")
+    fail_pending_requests(state)
+    {:stop, {:io_error, reason}, %{state | pending_requests: %{}}}
+  end
+
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     Logger.warning("CLI Server subprocess exited with status #{status}")
-
-    Enum.each(state.pending_requests, fn
-      {_id, {:send, from, _sid}} -> GenServer.reply(from, {:error, :connection_closed})
-      {_id, {:create_session, from}} -> GenServer.reply(from, {:error, :connection_closed})
-      {_id, {:destroy, from}} -> GenServer.reply(from, {:error, :connection_closed})
-      {_id, {:resume, from, _sid}} -> GenServer.reply(from, {:error, :connection_closed})
-      {_id, {:list_sessions, from}} -> GenServer.reply(from, {:error, :connection_closed})
-      {_id, {:set_model, from}} -> GenServer.reply(from, {:error, :connection_closed})
-      {_id, {:ping, from}} when not is_nil(from) -> GenServer.reply(from, {:error, :connection_closed})
-      _ -> :ok
-    end)
-
+    fail_pending_requests(state)
     {:stop, {:subprocess_exit, status}, %{state | port: nil, pending_requests: %{}}}
   end
 
@@ -350,6 +451,13 @@ defmodule Jido.GHCopilot.Server.Connection do
   def terminate(_reason, %{port: port} = _state) when not is_nil(port) do
     Port.close(port)
     :ok
+  end
+
+  def terminate(_reason, %{io_socket: sock, io_reader: reader}) when not is_nil(sock) do
+    if reader && Process.alive?(reader), do: Process.exit(reader, :kill)
+    :gen_tcp.close(sock)
+  catch
+    _, _ -> :ok
   end
 
   def terminate(_reason, _state), do: :ok
@@ -684,7 +792,14 @@ defmodule Jido.GHCopilot.Server.Connection do
     Port.command(port, encode_lsp_message(json))
   end
 
+  defp send_to_port(%{io_socket: sock}, json) when not is_nil(sock) do
+    :gen_tcp.send(sock, encode_lsp_message(json))
+  end
+
   defp send_to_port(_, _data), do: :ok
+
+  # Alias for clearer semantics when called from init_with_io
+  defp send_to_io(state, json), do: send_to_port(state, json)
 
   defp next_id(state) do
     {state.next_id, %{state | next_id: state.next_id + 1}}
@@ -701,4 +816,79 @@ defmodule Jido.GHCopilot.Server.Connection do
   end
 
   defp resolve_permission(_other, _info), do: :denied
+
+  # ── External I/O helpers ──
+
+  defp io_reader_loop(socket, parent) do
+    case :gen_tcp.recv(socket, 0, 5_000) do
+      {:ok, data} ->
+        send(parent, {:io_data, data})
+        io_reader_loop(socket, parent)
+
+      {:error, :timeout} ->
+        io_reader_loop(socket, parent)
+
+      {:error, :closed} ->
+        send(parent, :io_closed)
+
+      {:error, reason} ->
+        send(parent, {:io_error, reason})
+    end
+  end
+
+  defp wait_for_init_io(state, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    do_wait_for_init_io(state, deadline)
+  end
+
+  defp do_wait_for_init_io(state, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:error, :timeout}
+    else
+      receive do
+        {:io_data, data} ->
+          state = %{state | buffer: state.buffer <> data}
+
+          case extract_lsp_message(state.buffer) do
+            {:ok, json, rest} ->
+              state = %{state | buffer: rest}
+              state = handle_json_message(json, state)
+
+              if map_size(state.pending_requests) == 0 do
+                {:ok, state}
+              else
+                do_wait_for_init_io(state, deadline)
+              end
+
+            :incomplete ->
+              do_wait_for_init_io(state, deadline)
+          end
+
+        :io_closed ->
+          {:error, :connection_closed}
+
+        {:io_error, reason} ->
+          {:error, reason}
+      after
+        min(remaining, 1000) ->
+          do_wait_for_init_io(state, deadline)
+      end
+    end
+  end
+
+  defp fail_pending_requests(state) do
+    Enum.each(state.pending_requests, fn
+      {_id, {:send, from, _sid}} -> GenServer.reply(from, {:error, :connection_closed})
+      {_id, {:create_session, from}} -> GenServer.reply(from, {:error, :connection_closed})
+      {_id, {:destroy, from}} -> GenServer.reply(from, {:error, :connection_closed})
+      {_id, {:resume, from, _sid}} -> GenServer.reply(from, {:error, :connection_closed})
+      {_id, {:list_sessions, from}} -> GenServer.reply(from, {:error, :connection_closed})
+      {_id, {:set_model, from}} -> GenServer.reply(from, {:error, :connection_closed})
+      {_id, {:ping, from}} when not is_nil(from) -> GenServer.reply(from, {:error, :connection_closed})
+      _ -> :ok
+    end)
+  end
 end

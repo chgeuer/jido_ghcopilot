@@ -298,19 +298,9 @@ defmodule Jido.GHCopilot.Server.Connection do
 
     :gen_tcp.controlling_process(socket, reader)
     Kernel.send(reader, :socket_ready)
-    state = %{state | io_reader: reader}
 
-    init_timeout = state.init_timeout || to_timeout(minute: 2)
-
-    case ping_with_retry(state, init_timeout) do
-      {:ok, state} ->
-        Logger.info("CLI Server connection established (external I/O)")
-        {:noreply, state}
-
-      {:error, _reason} ->
-        Logger.error("CLI Server init failed (external I/O): ping timeout")
-        {:stop, :init_timeout, state}
-    end
+    Logger.info("CLI Server connection established (external I/O, reader started)")
+    {:noreply, %{state | io_reader: reader}}
   end
 
   def handle_cast(:start_io_reader_and_init, state), do: {:noreply, state}

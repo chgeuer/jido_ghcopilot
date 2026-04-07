@@ -114,4 +114,43 @@ defmodule Jido.GHCopilot.Mapper do
       raw: text
     })
   end
+
+  @doc """
+  Maps a CLI Server protocol event to normalized Harness Events.
+
+  Server events have `%{type: "assistant.message", data: %{...}}` format.
+  """
+  @spec map_server_event(map(), String.t()) :: [Event.t()]
+  def map_server_event(%{type: type, data: data}, session_id) do
+    ts = DateTime.utc_now() |> DateTime.to_iso8601()
+
+    case type do
+      "assistant.message" ->
+        [Event.new!(%{type: :output_text_delta, provider: :ghcopilot, session_id: session_id,
+          timestamp: ts, payload: data, raw: data})]
+
+      "assistant.usage" ->
+        [Event.new!(%{type: :usage, provider: :ghcopilot, session_id: session_id,
+          timestamp: ts, payload: data, raw: data})]
+
+      "tool.execution_start" ->
+        [Event.new!(%{type: :tool_call, provider: :ghcopilot, session_id: session_id,
+          timestamp: ts, payload: data, raw: data})]
+
+      "tool.execution_complete" ->
+        [Event.new!(%{type: :tool_result, provider: :ghcopilot, session_id: session_id,
+          timestamp: ts, payload: data, raw: data})]
+
+      "session.error" ->
+        [Event.new!(%{type: :session_failed, provider: :ghcopilot, session_id: session_id,
+          timestamp: ts, payload: data, raw: data})]
+
+      _ ->
+        [Event.new!(%{type: :ghcopilot_server_event, provider: :ghcopilot, session_id: session_id,
+          timestamp: ts, payload: Map.put(data || %{}, "event_type", type), raw: %{type: type, data: data}})]
+    end
+  end
+
+  def map_server_event(%{type: type}, session_id), do: map_server_event(%{type: type, data: %{}}, session_id)
+  def map_server_event(_, _session_id), do: []
 end

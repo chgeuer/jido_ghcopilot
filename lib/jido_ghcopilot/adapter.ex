@@ -55,9 +55,11 @@ defmodule Jido.GHCopilot.Adapter do
   @impl true
   @spec run(RunRequest.t(), keyword()) :: {:ok, Enumerable.t()} | {:error, term()}
   def run(%RunRequest{} = request, opts \\ []) when is_list(opts) do
+    transport = Keyword.get(opts, :transport, {Jido.GHCopilot.Transport.Local, []})
+
     with {:ok, normalized} <- Options.from_run_request(request, opts),
          :ok <- compatibility_module().check() do
-      {:ok, build_event_stream(normalized)}
+      {:ok, build_transport_stream(normalized, transport)}
     end
   rescue
     e in [ArgumentError] ->
@@ -106,6 +108,112 @@ defmodule Jido.GHCopilot.Adapter do
       fn state -> receive_output(state, session_id, mapper) end,
       fn state -> cleanup(state, session_id) end
     )
+  end
+
+  # Build an event stream using the CLI Server protocol over a pluggable transport.
+  # Follows the same pattern as CopilotServerBridge in ex_paperclip and
+  # SessionServer in copilot_lv: Connection → subscribe → send_prompt → event loop.
+  #
+  # Server events are emitted as Harness Events with the raw copilot format
+  # (type: "assistant.message", "tool.execution_start", etc.) so that
+  # HarnessEventNormalizer can process them uniformly.
+  defp build_transport_stream(%Options{} = options, {transport_module, transport_opts}) do
+    alias Jido.GHCopilot.Server.Connection
+
+    session_id = "ghcopilot-" <> Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)
+
+    transport_opts = Keyword.put_new(transport_opts, :cwd, options.cwd)
+    {:ok, handle} = transport_module.start(transport_opts)
+    conn_opts = transport_module.connection_opts(handle, permission_handler: :auto_approve)
+
+    tools = Keyword.get(transport_opts, :tools, [])
+    prompt = options.prompt || ""
+    timeout_ms = options.timeout_ms || to_timeout(minute: 10)
+
+    Stream.resource(
+      fn ->
+        {:ok, conn} = Connection.start_link(conn_opts)
+        Process.monitor(conn)
+
+        session_opts = %{model: options.model, tools: tools, request_permission: true}
+        {:ok, sid} = Connection.create_session(conn, session_opts)
+        :ok = Connection.subscribe(conn, sid)
+        {:ok, _msg_id} = Connection.send_prompt(conn, sid, prompt)
+
+        started = Event.new!(%{
+          type: :session_started,
+          provider: :ghcopilot,
+          session_id: session_id,
+          timestamp: DateTime.utc_now() |> DateTime.to_iso8601(),
+          payload: %{"session_id" => session_id, "server_session_id" => sid},
+          raw: nil
+        })
+
+        %{conn: conn, session_id: session_id, server_session_id: sid,
+          pending: [started], done: false}
+      end,
+      fn
+        %{done: true} = state ->
+          {:halt, state}
+
+        %{pending: [e | rest]} = state ->
+          {[e], %{state | pending: rest}}
+
+        state ->
+          receive do
+            {:server_event, %{type: "session.idle"}} ->
+              {:halt, state}
+
+            {:server_event, %{type: type, data: data}} ->
+              event = server_event_to_harness(type, data, state.session_id)
+              {List.wrap(event), state}
+
+            {:server_event, %{type: type}} ->
+              event = server_event_to_harness(type, %{}, state.session_id)
+              {List.wrap(event), state}
+
+            {:DOWN, _, :process, pid, _} when pid == state.conn ->
+              {:halt, %{state | done: true}}
+          after
+            timeout_ms ->
+              {:halt, %{state | done: true}}
+          end
+      end,
+      fn state ->
+        if state[:conn] && Process.alive?(state.conn) do
+          Connection.stop(state.conn)
+        end
+      end
+    )
+  end
+
+  # Map Copilot Server events directly to Harness Events, preserving the
+  # copilot event format that HarnessEventNormalizer already understands.
+  defp server_event_to_harness(type, data, session_id) do
+    ts = DateTime.utc_now() |> DateTime.to_iso8601()
+
+    harness_type =
+      case type do
+        "assistant.message" -> :output_text_delta
+        "assistant.usage" -> :usage
+        "assistant.reasoning" -> :thinking_delta
+        "assistant.turn_start" -> :turn_start
+        "assistant.turn_end" -> :turn_end
+        "tool.execution_start" -> :tool_use_start
+        "tool.execution_complete" -> :tool_use_end
+        "session.error" -> :session_failed
+        "session.start" -> :session_started
+        _ -> :ghcopilot_event
+      end
+
+    Event.new!(%{
+      type: harness_type,
+      provider: :ghcopilot,
+      session_id: session_id,
+      timestamp: ts,
+      payload: data || %{},
+      raw: %{"type" => type, "data" => data}
+    })
   end
 
   defp start_process(cli_path, args, options, session_id, timeout_ms) do

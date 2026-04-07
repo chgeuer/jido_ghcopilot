@@ -33,6 +33,7 @@ defmodule Jido.GHCopilot.Server.Connection do
     :port_pid,
     :io_socket,
     :io_reader,
+    :init_timeout,
     buffer: <<>>,
     next_id: 1,
     pending_requests: %{},
@@ -47,7 +48,19 @@ defmodule Jido.GHCopilot.Server.Connection do
 
   @doc "Start a new CLI Server connection."
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: opts[:name])
+    socket = Keyword.get(opts, :io)
+
+    case GenServer.start_link(__MODULE__, opts, name: opts[:name]) do
+      {:ok, pid} = ok ->
+        if socket do
+          :gen_tcp.controlling_process(socket, pid)
+          GenServer.cast(pid, :start_io_reader_and_init)
+        end
+        ok
+
+      error ->
+        error
+    end
   end
 
   @doc "Ping the server. Returns `{:ok, response}` or `{:error, reason}`."
@@ -137,30 +150,17 @@ defmodule Jido.GHCopilot.Server.Connection do
   # attaches to its stdio via the given socket.
   defp init_with_io(socket, opts) do
     permission_handler = Keyword.get(opts, :permission_handler, :auto_approve)
-
-    parent = self()
-    reader = spawn_link(fn -> io_reader_loop(socket, parent) end)
+    init_timeout = Keyword.get(opts, :timeout, to_timeout(minute: 2))
 
     state = %__MODULE__{
       io_socket: socket,
-      io_reader: reader,
-      permission_handler: permission_handler
+      permission_handler: permission_handler,
+      init_timeout: init_timeout
     }
 
-    # The remote server may take time to initialize (Node.js startup, native
-    # addon extraction, etc.). Retry the ping with increasing delays rather
-    # than sending it once and hoping.
-    init_timeout = Keyword.get(opts, :timeout, to_timeout(minute: 2))
-
-    case ping_with_retry(state, init_timeout) do
-      {:ok, state} ->
-        Logger.info("CLI Server connection established (external I/O)")
-        {:ok, state}
-
-      {:error, reason} ->
-        Logger.error("CLI Server init failed (external I/O): #{inspect(reason)}")
-        {:stop, :init_timeout}
-    end
+    # Reader and init ping are deferred to :start_io_reader_and_init cast
+    # (sent from start_link after socket ownership is transferred)
+    {:ok, state}
   end
 
   defp ping_with_retry(state, total_timeout, attempt \\ 1) do
@@ -282,6 +282,38 @@ defmodule Jido.GHCopilot.Server.Connection do
         {:stop, :init_timeout, state}
     end
   end
+
+  @impl true
+  def handle_cast(:start_io_reader_and_init, %{io_socket: socket} = state) when not is_nil(socket) do
+    parent = self()
+
+    reader =
+      spawn_link(fn ->
+        receive do
+          :socket_ready -> io_reader_loop(socket, parent)
+        after
+          10_000 -> :ok
+        end
+      end)
+
+    :gen_tcp.controlling_process(socket, reader)
+    Kernel.send(reader, :socket_ready)
+    state = %{state | io_reader: reader}
+
+    init_timeout = state.init_timeout || to_timeout(minute: 2)
+
+    case ping_with_retry(state, init_timeout) do
+      {:ok, state} ->
+        Logger.info("CLI Server connection established (external I/O)")
+        {:noreply, state}
+
+      {:error, _reason} ->
+        Logger.error("CLI Server init failed (external I/O): ping timeout")
+        {:stop, :init_timeout, state}
+    end
+  end
+
+  def handle_cast(:start_io_reader_and_init, state), do: {:noreply, state}
 
   @impl true
   def handle_call({:ping, message}, from, state) do

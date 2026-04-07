@@ -29,6 +29,8 @@ defmodule Jido.GHCopilot.ACP.Connection do
   defstruct [
     :port,
     :port_pid,
+    :io_socket,
+    :io_reader,
     :init_result,
     buffer: "",
     next_id: 1,
@@ -43,7 +45,20 @@ defmodule Jido.GHCopilot.ACP.Connection do
 
   @doc "Start a new ACP connection."
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: opts[:name])
+    socket = Keyword.get(opts, :io)
+
+    case GenServer.start_link(__MODULE__, opts, name: opts[:name]) do
+      {:ok, pid} = ok ->
+        if socket do
+          :gen_tcp.controlling_process(socket, pid)
+          GenServer.cast(pid, :start_io_reader)
+          GenServer.cast(pid, :send_initialize)
+        end
+        ok
+
+      error ->
+        error
+    end
   end
 
   @doc "Get the initialization result (capabilities, agent info)."
@@ -95,6 +110,13 @@ defmodule Jido.GHCopilot.ACP.Connection do
 
   @impl true
   def init(opts) do
+    case Keyword.get(opts, :io) do
+      nil -> init_spawn_local(opts)
+      socket -> init_with_io(socket, opts)
+    end
+  end
+
+  defp init_spawn_local(opts) do
     cli_path = Keyword.get(opts, :cli_path) || Jido.GHCopilot.CLI.resolve_path()
 
     if is_nil(cli_path) do
@@ -112,6 +134,19 @@ defmodule Jido.GHCopilot.ACP.Connection do
 
       {:ok, state, {:continue, :start_connection}}
     end
+  end
+
+  defp init_with_io(socket, opts) do
+    permission_handler = Keyword.get(opts, :permission_handler, :auto_approve)
+
+    state = %__MODULE__{
+      io_socket: socket,
+      permission_handler: permission_handler
+    }
+
+    # Reader is started via :start_io_reader cast (after socket ownership transfer in start_link).
+    # Initialize is sent via :send_initialize cast which is queued AFTER :start_io_reader.
+    {:ok, state}
   end
 
   @impl true
@@ -254,6 +289,11 @@ defmodule Jido.GHCopilot.ACP.Connection do
     :ok
   end
 
+  def terminate(_reason, %{io_socket: sock}) when not is_nil(sock) do
+    :gen_tcp.close(sock)
+    :ok
+  end
+
   def terminate(_reason, _state), do: :ok
 
   # ── Internal ──
@@ -370,7 +410,85 @@ defmodule Jido.GHCopilot.ACP.Connection do
     Port.command(port, [data, "\n"])
   end
 
+  defp send_to_port(%{io_socket: sock}, data) when not is_nil(sock) do
+    :gen_tcp.send(sock, data <> "\n")
+  end
+
   defp send_to_port(_, _data), do: :ok
+
+  # ── I/O socket support (Firecracker vsock) ──
+
+  @impl true
+  def handle_cast(:start_io_reader, %{io_socket: socket} = state) when not is_nil(socket) do
+    parent = self()
+
+    reader =
+      spawn_link(fn ->
+        receive do
+          :socket_ready -> io_reader_loop(socket, parent)
+        after
+          10_000 -> :ok
+        end
+      end)
+
+    :gen_tcp.controlling_process(socket, reader)
+    Kernel.send(reader, :socket_ready)
+    {:noreply, %{state | io_reader: reader}}
+  end
+
+  def handle_cast(:start_io_reader, state), do: {:noreply, state}
+
+  def handle_cast(:send_initialize, state) do
+    {id, state} = next_id(state)
+    request = Protocol.initialize_request(id)
+    send_to_port(state, request)
+    {:noreply, %{state | pending_requests: Map.put(state.pending_requests, id, :initialize)}}
+  end
+
+  def handle_info({:io_data, data}, %{io_socket: sock} = state) when not is_nil(sock) do
+    buffer = state.buffer <> data
+    {lines, remaining} = split_complete_lines(buffer)
+
+    state = %{state | buffer: remaining}
+    state = Enum.reduce(lines, state, fn line, st -> handle_line(line, st) end)
+    {:noreply, state}
+  end
+
+  def handle_info(:io_closed, state) do
+    Logger.warning("[copilot-acp] I/O connection closed")
+    Enum.each(state.pending_requests, fn
+      {_id, {:prompt, from, _sid}} -> GenServer.reply(from, {:error, :connection_closed})
+      {_id, {:new_session, from}} -> GenServer.reply(from, {:error, :connection_closed})
+      _ -> :ok
+    end)
+    {:stop, :normal, %{state | io_socket: nil, pending_requests: %{}}}
+  end
+
+  def handle_info({:io_error, reason}, state) do
+    Logger.error("[copilot-acp] I/O error: #{inspect(reason)}")
+    {:stop, {:io_error, reason}, state}
+  end
+
+  defp io_reader_loop(socket, parent) do
+    case :gen_tcp.recv(socket, 0, 5_000) do
+      {:ok, data} ->
+        Kernel.send(parent, {:io_data, data})
+        io_reader_loop(socket, parent)
+      {:error, :timeout} ->
+        io_reader_loop(socket, parent)
+      {:error, :closed} ->
+        Kernel.send(parent, :io_closed)
+      {:error, reason} ->
+        Kernel.send(parent, {:io_error, reason})
+    end
+  end
+
+  defp split_complete_lines(buffer) do
+    case String.split(buffer, "\n", parts: 2) do
+      [line, rest] -> {more, rem} = split_complete_lines(rest); {[line | more], rem}
+      [incomplete] -> {[], incomplete}
+    end
+  end
 
   defp next_id(state) do
     {state.next_id, %{state | next_id: state.next_id + 1}}

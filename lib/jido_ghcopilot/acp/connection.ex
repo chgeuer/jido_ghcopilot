@@ -52,6 +52,7 @@ defmodule Jido.GHCopilot.ACP.Connection do
         if socket do
           :gen_tcp.controlling_process(socket, pid)
           GenServer.cast(pid, :start_io_reader)
+          GenServer.cast(pid, :send_initialize)
         end
         ok
 
@@ -143,8 +144,9 @@ defmodule Jido.GHCopilot.ACP.Connection do
       permission_handler: permission_handler
     }
 
-    # Reader started via :start_io_reader cast after socket ownership transfer
-    {:ok, state, {:continue, :send_initialize}}
+    # Reader is started via :start_io_reader cast (after socket ownership transfer in start_link).
+    # Initialize is sent via :send_initialize cast which is queued AFTER :start_io_reader.
+    {:ok, state}
   end
 
   @impl true
@@ -436,8 +438,7 @@ defmodule Jido.GHCopilot.ACP.Connection do
 
   def handle_cast(:start_io_reader, state), do: {:noreply, state}
 
-  @impl true
-  def handle_continue(:send_initialize, state) do
+  def handle_cast(:send_initialize, state) do
     {id, state} = next_id(state)
     request = Protocol.initialize_request(id)
     send_to_port(state, request)

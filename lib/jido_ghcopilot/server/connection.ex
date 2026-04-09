@@ -16,7 +16,7 @@ defmodule Jido.GHCopilot.Server.Connection do
   alias Jido.GHCopilot.Server.ConnectionProtocol
 
   @default_timeout to_timeout(second: 30)
-  @ping_delays [2_000, 5_000, 10_000, 15_000, 20_000, 30_000]
+  @ping_delays [5_000, 5_000, 10_000, 15_000, 20_000, 30_000]
 
   @doc """
   Start a new CLI Server connection with ping-with-retry initialization.
@@ -148,7 +148,7 @@ defmodule Jido.GHCopilot.Server.Connection do
     delay = Enum.at(@ping_delays, min(attempt - 1, length(@ping_delays) - 1))
     Process.sleep(delay)
 
-    case BaseConnection.call_rpc(conn, "ping", %{"message" => "init-#{attempt}"}, :ping, 15_000) do
+    case BaseConnection.call_rpc(conn, "ping", %{"message" => "init-#{attempt}"}, :ping, 30_000) do
       {:ok, _} ->
         :ok
 

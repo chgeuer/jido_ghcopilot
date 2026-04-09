@@ -75,7 +75,7 @@ defmodule Jido.GHCopilot.ACP.MultiTurnTest do
 
   defp collect_updates(acc, timeout_ms) do
     receive do
-      {:acp_update, update} -> collect_updates([update | acc], timeout_ms)
+      {:connection_event, _sid, update} -> collect_updates([update | acc], timeout_ms)
     after
       timeout_ms -> Enum.reverse(acc)
     end

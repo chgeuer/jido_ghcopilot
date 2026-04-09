@@ -77,7 +77,7 @@ defmodule Jido.GHCopilot.MixProject do
       {:splode, "~> 0.3"},
       {:jido, "~> 2.1", override: true},
       # Not yet on hex.pm — use local sibling checkouts with override
-      {:jido_harness, github: "agentjido/jido_harness", override: true},
+      {:jido_harness, path: "../../agentjido/jido_harness", override: true},
       {:jido_shell, github: "agentjido/jido_shell", override: true},
       {:jido_vfs, github: "agentjido/jido_vfs", override: true},
       {:sprites, github: "mikehostetler/sprites-ex", override: true},

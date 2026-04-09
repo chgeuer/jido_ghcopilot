@@ -10,8 +10,8 @@ defmodule Jido.GHCopilot.ACP.ConnectionTest do
     test "initialize → session/new → prompt → receive thinking + text" do
       {:ok, conn} = Connection.start_link()
 
-      # 1. Check init result
-      {:ok, init} = Connection.init_result(conn)
+      # 1. Initialize and check result
+      {:ok, init} = Connection.initialize(conn)
       assert init.protocol_version == 1
       assert init.agent_info.name == "Copilot"
       assert init.agent_capabilities.load_session == true
@@ -65,6 +65,7 @@ defmodule Jido.GHCopilot.ACP.ConnectionTest do
     @tag timeout: to_timeout(minute: 1)
     test "multi-turn conversation on same session" do
       {:ok, conn} = Connection.start_link()
+      {:ok, _init} = Connection.initialize(conn)
       {:ok, session_id} = Connection.new_session(conn, System.tmp_dir!())
       :ok = Connection.subscribe(conn, session_id)
 
@@ -103,7 +104,7 @@ defmodule Jido.GHCopilot.ACP.ConnectionTest do
 
   defp collect_updates(acc, timeout_ms) do
     receive do
-      {:acp_update, update} ->
+      {:connection_event, _sid, update} ->
         collect_updates([update | acc], timeout_ms)
     after
       timeout_ms ->

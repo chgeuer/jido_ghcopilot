@@ -161,14 +161,14 @@ defmodule Jido.GHCopilot.Adapter do
 
         state ->
           receive do
-            {:server_event, %{type: "session.idle"}} ->
+            {:connection_event, _sid, %{type: "session.idle"}} ->
               {:halt, state}
 
-            {:server_event, %{type: type, data: data}} ->
+            {:connection_event, _sid, %{type: type, data: data}} ->
               event = server_event_to_harness(type, data, state.session_id)
               {List.wrap(event), state}
 
-            {:server_event, %{type: type}} ->
+            {:connection_event, _sid, %{type: type}} ->
               event = server_event_to_harness(type, %{}, state.session_id)
               {List.wrap(event), state}
 

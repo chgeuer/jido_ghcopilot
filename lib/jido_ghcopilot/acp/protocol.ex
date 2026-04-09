@@ -145,6 +145,11 @@ defmodule Jido.GHCopilot.ACP.Protocol do
 
   # ── Session Update Parsing ──
 
+  @doc "Parse a raw session update map into a `SessionUpdate` struct."
+  def decode_session_update(session_id, update) do
+    parse_session_update(session_id, update)
+  end
+
   defp parse_session_update(session_id, %{"sessionUpdate" => type} = update) do
     update_type = decode_update_type(type)
 

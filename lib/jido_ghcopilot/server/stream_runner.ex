@@ -58,7 +58,7 @@ defmodule Jido.GHCopilot.Server.StreamRunner do
       wait_ms = min(remaining, 500)
 
       receive do
-        {:server_event, %SessionEvent{session_id: ^session_id} = event} ->
+        {:connection_event, _sid, %SessionEvent{session_id: ^session_id} = event} ->
           dispatch_event(agent_pid, session_id, event)
 
           # session.idle means the turn is complete

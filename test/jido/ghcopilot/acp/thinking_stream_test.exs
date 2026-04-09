@@ -9,6 +9,7 @@ defmodule Jido.GHCopilot.ACP.ThinkingStreamTest do
     @tag timeout: to_timeout(minute: 1)
     test "agent_thought_chunk events are separate from agent_message_chunk" do
       {:ok, conn} = Connection.start_link()
+      {:ok, _init} = Connection.initialize(conn)
       {:ok, session_id} = Connection.new_session(conn, System.tmp_dir!())
       :ok = Connection.subscribe(conn, session_id)
 
@@ -48,7 +49,7 @@ defmodule Jido.GHCopilot.ACP.ThinkingStreamTest do
 
   defp collect_updates(acc, timeout_ms) do
     receive do
-      {:acp_update, update} -> collect_updates([update | acc], timeout_ms)
+      {:connection_event, _sid, update} -> collect_updates([update | acc], timeout_ms)
     after
       timeout_ms -> Enum.reverse(acc)
     end

@@ -23,6 +23,7 @@ defmodule Jido.GHCopilot.Executor.ACP do
     cwd = args[:cwd] || File.cwd!()
 
     with {:ok, conn} <- Connection.start_link(cli_args: cli_args),
+         {:ok, _init} <- Connection.initialize(conn),
          {:ok, session_id} <- Connection.new_session(conn, cwd, args[:mcp_servers] || []) do
       agent_pid = args.agent_pid
 

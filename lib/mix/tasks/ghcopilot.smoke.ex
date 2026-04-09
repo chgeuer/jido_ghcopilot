@@ -150,7 +150,7 @@ defmodule Mix.Tasks.Ghcopilot.Smoke do
 
   defp drain_acp_events(acc) do
     receive do
-      {:acp_update, %{update_type: type, data: data}} ->
+      {:connection_event, _sid, %{update_type: type, data: data}} ->
         type_str = to_string(type)
         acc = update_in(acc.events, &Map.update(&1, type_str, 1, fn n -> n + 1 end))
 
@@ -189,7 +189,7 @@ defmodule Mix.Tasks.Ghcopilot.Smoke do
       wait_ms = min(remaining, 500)
 
       receive do
-        {:server_event, %{session_id: ^session_id, type: type, data: data}} ->
+        {:connection_event, _sid, %{session_id: ^session_id, type: type, data: data}} ->
           acc = update_in(acc.events, &Map.update(&1, type, 1, fn n -> n + 1 end))
 
           acc =
@@ -216,7 +216,6 @@ defmodule Mix.Tasks.Ghcopilot.Smoke do
                 %{acc | usage: acc.usage ++ [usage_entry]}
 
               "session.idle" ->
-                # Turn complete — drain remaining events briefly then return
                 drain_remaining_server(acc, session_id)
 
               _ ->
@@ -237,7 +236,7 @@ defmodule Mix.Tasks.Ghcopilot.Smoke do
 
   defp drain_remaining_server(acc, session_id) do
     receive do
-      {:server_event, %{session_id: ^session_id, type: "assistant.usage", data: data}} ->
+      {:connection_event, _sid, %{session_id: ^session_id, type: "assistant.usage", data: data}} ->
         usage_entry = %{
           model: data["model"],
           input_tokens: data["inputTokens"] || 0,
@@ -250,7 +249,7 @@ defmodule Mix.Tasks.Ghcopilot.Smoke do
 
         drain_remaining_server(%{acc | usage: acc.usage ++ [usage_entry]}, session_id)
 
-      {:server_event, %{session_id: ^session_id}} ->
+      {:connection_event, _sid, %{session_id: ^session_id}} ->
         drain_remaining_server(acc, session_id)
     after
       300 ->

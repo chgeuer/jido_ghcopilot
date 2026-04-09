@@ -38,8 +38,8 @@ defmodule Jido.GHCopilot.RoundTripTest do
       :ok = StubConnection.subscribe(conn, session_id)
       {:ok, :end_turn} = StubConnection.prompt(conn, session_id, "test", 5_000)
 
-      # Events should be in our mailbox as {:acp_update, %SessionUpdate{}}
-      assert_receive {:acp_update, update}, 500
+      # Events should be in our mailbox as {:connection_event, session_id, %SessionUpdate{}}
+      assert_receive {:connection_event, _sid, update}, 500
       assert %SessionUpdate{update_type: :agent_message_chunk} = update
       assert update.data.text == "ROUND_TRIP_OK"
 
@@ -56,7 +56,7 @@ defmodule Jido.GHCopilot.RoundTripTest do
       :ok = StubConnection.subscribe(conn, session_id)
       {:ok, _} = StubConnection.prompt(conn, session_id, "test", 5_000)
 
-      assert_receive {:acp_update, %SessionUpdate{update_type: :agent_thought_chunk, data: data}}, 500
+      assert_receive {:connection_event, _sid, %SessionUpdate{update_type: :agent_thought_chunk, data: data}}, 500
       assert data.text == "Reasoning..."
 
       StubConnection.stop(conn)
@@ -154,7 +154,7 @@ defmodule Jido.GHCopilot.RoundTripTest do
 
   defp drain_updates(acc \\ []) do
     receive do
-      {:acp_update, update} -> drain_updates([update | acc])
+      {:connection_event, _sid, update} -> drain_updates([update | acc])
     after
       100 -> Enum.reverse(acc)
     end

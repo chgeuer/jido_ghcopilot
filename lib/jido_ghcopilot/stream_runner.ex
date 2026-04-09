@@ -76,7 +76,7 @@ defmodule Jido.GHCopilot.StreamRunner do
 
   defp forward_loop(agent_pid, session_id) do
     receive do
-      {:acp_update, update} ->
+      {:connection_event, _sid, update} ->
         dispatch_update(agent_pid, session_id, update)
         forward_loop(agent_pid, session_id)
     after

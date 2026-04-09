@@ -177,6 +177,7 @@ defmodule Jido.GHCopilot do
       cli_args = build_acp_cli_args(validated)
 
       with {:ok, conn} <- Connection.start_link(cli_args: cli_args),
+           {:ok, _init} <- Connection.initialize(conn),
            {:ok, session_id} <- Connection.new_session(conn, cwd, mcp_servers) do
         {:ok, conn, session_id}
       end
@@ -202,7 +203,7 @@ defmodule Jido.GHCopilot do
     end
   end
 
-  @doc "Subscribe to ACP session updates. Updates arrive as `{:acp_update, update}` messages."
+  @doc "Subscribe to ACP session updates. Updates arrive as `{:connection_event, session_id, update}` messages."
   @spec subscribe(pid(), String.t()) :: :ok
   def subscribe(conn, session_id) do
     Connection.subscribe(conn, session_id)
